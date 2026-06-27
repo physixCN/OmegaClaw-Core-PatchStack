@@ -15,6 +15,7 @@
 !(import! &self (library OmegaClaw-Core ./channels/websearch.py))
 !(import! &self (library OmegaClaw-Core ./src/channels))
 !(import! &self (library OmegaClaw-Core ./src/harness_descriptors))
+!(import! &self (library OmegaClaw-Core ./src/harness_feedback))
 !(import! &self (library OmegaClaw-Core ./src/skills))
 !(import! &self (library OmegaClaw-Core ./src/memory))
 !(import! &self (library OmegaClaw-Core ./src/context))

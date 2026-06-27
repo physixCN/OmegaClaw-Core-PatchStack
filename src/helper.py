@@ -82,6 +82,34 @@ _FALLBACK_CAPABILITY_DESCRIPTOR_TEXT = """
 (CapabilityErrorRecovery metta metta-eval-error "Expression parsed but evaluation failed: simplify, inspect docs/files, or use known working NAL/PLN patterns; do not keep retrying format guesses.")
 """
 
+_COMMAND_SHAPE_HEADS = {
+    "remember",
+    "query",
+    "episodes",
+    "pin",
+    "shell",
+    "read-file",
+    "write-file",
+    "append-file",
+    "send",
+    "search",
+    "tavily-search",
+    "technical-analysis",
+    "metta",
+    "syntax-error",
+}
+_COMMAND_SHAPE_RE = re.compile(r"^\(\s*([A-Za-z][A-Za-z0-9_-]*)")
+
+
+def describe_command_shape(command_text):
+    """Return an inert MeTTa command-shape atom for syntax only."""
+    text = str(command_text or "").strip()
+    match = _COMMAND_SHAPE_RE.match(text)
+    head = match.group(1) if match else "unknown"
+    if head not in _COMMAND_SHAPE_HEADS:
+        head = "unknown"
+    return f"(CommandShape {head})"
+
 
 def quote_arg(value):
     return json.dumps(str(value), ensure_ascii=False)
