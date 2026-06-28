@@ -9,7 +9,9 @@ EPISODES_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 EPISODES_ISO_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:Z)?$")
 
 DESCRIPTOR_PATH = Path(__file__).with_name("harness_descriptors.metta")
+CONTEXT_POLICY_PATH = Path(__file__).with_name("harness_context.metta")
 _DESCRIPTOR_CACHE = None
+_CONTEXT_POLICY_CACHE = None
 SYNTAX_ERROR_RAW_LIMIT = 1200
 
 _FALLBACK_CAPABILITY_DESCRIPTOR_TEXT = """
@@ -99,6 +101,87 @@ _COMMAND_SHAPE_HEADS = {
     "syntax-error",
 }
 _COMMAND_SHAPE_RE = re.compile(r"^\(\s*([A-Za-z][A-Za-z0-9_-]*)")
+_CONTEXT_WINDOW_RE = re.compile(r"\(ContextWindow\s+([^\s()]+)\s+([^\s()]+)\s+([0-9]+)\s*\)")
+_CONTEXT_FRESH_RE = re.compile(r"\(ContextFresh\s+([^\s()]+)\s+([^\s()]+)\s+([0-9]+)\s*\)")
+_CONTEXT_LARGE_RE = re.compile(r"\(ContextLarge\s+([^\s()]+)\s+([0-9]+)\s*\)")
+_CONTEXT_OMIT_RE = re.compile(r"\(ContextOmitAlways\s+([^\s()]+)\s*\)")
+_CONTEXT_NOCOMPACT_RE = re.compile(r"\(ContextNoCompact\s+([^\s()]+)\s*\)")
+_CONTEXT_SINGLETON_RE = re.compile(r"\(ContextSingleton\s+([^\s()]+)\s*\)")
+_CONTEXT_COLLAPSE_RE = re.compile(r"\(ContextCollapse\s+([^\s()]+)\s*\)")
+_CONTEXT_POINTER_RE = re.compile(r"\(ContextPointer\s+([^\s()]+)\s*\)")
+_HISTORY_ENTRY_RE = re.compile(r'(?=\("\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")')
+_HISTORY_TIME_RE = re.compile(r'\("(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"')
+_QUOTED_COMMAND_RE = re.compile(r'\((send|pin|query|episodes|search|read-file|write-file|append-file)\s+"((?:[^"\\]|\\.)*)"', re.S)
+_UNDERSCORE_QUOTED_COMMAND_RE = re.compile(r"\((send|pin|query|episodes|search|read-file|write-file|append-file)\s+_quote_(.*?)_quote_", re.S)
+_HUMAN_MESSAGE_RE = re.compile(r'"HUMAN_MESSAGE:\s*"\s*(.*?)(?:\n\s*\(\(|\n\s*ERROR_FEEDBACK:|\Z)', re.S)
+_PROMPT_ECHO_MARKERS = (
+    "CHARS_SENT:",
+    "PROMPT:",
+    " SKILLS:",
+    " OUTPUT_FORMAT:",
+    " LAST_SKILL_USE_RESULTS:",
+    " HISTORY:",
+)
+_ANTI_SPAM_MARKER = "DO NOT RE-SEND OR SPAM"
+_WAKE_RE = re.compile(r"Wake pulse\s+\d+", re.I)
+_WAKE_CHATTER_RE = re.compile(r"\b(?:ready|awaiting|standing by)\b", re.I)
+_SYNTAX_ERROR_TOKEN = "SYNTAX" + "-ERROR"
+_ERROR_CONTEXT_RE = re.compile(
+    r"ERROR_FEEDBACK:|syntax-error|"
+    + re.escape(_SYNTAX_ERROR_TOKEN)
+    + r"|SINGLE_COMMAND_FORMAT_ERROR|unknown-command|invalid-metta|metta-eval-error",
+    re.I,
+)
+_SYNTAX_ERROR_RE = re.compile(
+    r'\(syntax-error\s+"((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"\)',
+    re.S,
+)
+_LIVE_ERROR_NOISE_HEADS = (
+    "LAST_SKILL_USE_RESULTS",
+    "LAST_RESULTS_VIEW",
+    "SKILL" + "_RESULTS",
+    "RAW_RESULTS",
+    "RESULTS",
+    "HISTORY",
+    "CONTEXT_VIEW",
+    "HUMAN_RECENT",
+    "PIN_RECENT",
+    "SEND_RECENT",
+    "RECALL_RECENT",
+    "ERROR_RECENT",
+    "OMITTED_CONTEXT",
+)
+_ARTIFACT_POINTER_RE = re.compile(r"(?:/tmp/[^\s\"')]+|[A-Za-z0-9_.-]+\.(?:md|txt|json|html|csv|metta|py))")
+
+_FALLBACK_CONTEXT_POLICY_TEXT = """
+(ContextWindow human-message full 1)
+(ContextWindow human-message compact 6)
+(ContextWindow human-message breadcrumb 12)
+(ContextWindow pin full 1)
+(ContextWindow pin compact 7)
+(ContextSingleton pin)
+(ContextWindow send exact 6)
+(ContextNoCompact send)
+(ContextWindow artifact-pointer compact 16)
+(ContextWindow recall-result compact 10)
+(ContextWindow error compact 3)
+(ContextFresh raw-result full 2)
+(ContextFresh raw-result excerpt 3)
+(ContextFresh raw-result pointer 8)
+(ContextFresh recall-result full 1)
+(ContextFresh recall-result excerpt 5)
+(ContextFresh recall-result pointer 12)
+(ContextFresh error full 1)
+(ContextFresh error compact 3)
+(ContextLarge raw-result 6000)
+(ContextLarge send 6000)
+(ContextOmitAlways prompt-echo)
+(ContextOmitAlways anti-spam-echo)
+(ContextOmitAlways wake-chatter)
+(ContextCollapse repeated-skill-result)
+(ContextCollapse duplicate-error)
+(ContextPointer artifact-pointer)
+"""
 
 
 def describe_command_shape(command_text):
@@ -109,6 +192,428 @@ def describe_command_shape(command_text):
     if head not in _COMMAND_SHAPE_HEADS:
         head = "unknown"
     return f"(CommandShape {head})"
+
+
+def _context_policy_source():
+    try:
+        return CONTEXT_POLICY_PATH.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return _FALLBACK_CONTEXT_POLICY_TEXT
+
+
+def _load_context_policy():
+    """Load MeTTa-owned context policy atoms into mechanical lookup tables."""
+    global _CONTEXT_POLICY_CACHE
+    if _CONTEXT_POLICY_CACHE is not None:
+        return _CONTEXT_POLICY_CACHE
+    text = _context_policy_source()
+    policy = {
+        "windows": {},
+        "fresh": {},
+        "large": {},
+        "omit_always": set(),
+        "no_compact": set(),
+        "singleton": set(),
+        "collapse": set(),
+        "pointer": set(),
+    }
+    for role, mode, count in _CONTEXT_WINDOW_RE.findall(text):
+        policy["windows"][(role, mode)] = int(count)
+    for role, mode, cycles in _CONTEXT_FRESH_RE.findall(text):
+        policy["fresh"][(role, mode)] = int(cycles)
+    for role, chars in _CONTEXT_LARGE_RE.findall(text):
+        policy["large"][role] = int(chars)
+    policy["omit_always"].update(_CONTEXT_OMIT_RE.findall(text))
+    policy["no_compact"].update(_CONTEXT_NOCOMPACT_RE.findall(text))
+    policy["singleton"].update(_CONTEXT_SINGLETON_RE.findall(text))
+    policy["collapse"].update(_CONTEXT_COLLAPSE_RE.findall(text))
+    policy["pointer"].update(_CONTEXT_POINTER_RE.findall(text))
+    _CONTEXT_POLICY_CACHE = policy
+    return policy
+
+
+def _context_window(role, mode, default):
+    return _load_context_policy()["windows"].get((role, mode), default)
+
+
+def _context_large(role, default):
+    return _load_context_policy()["large"].get(role, default)
+
+
+def _core_memory_path(name):
+    return Path(__file__).resolve().parents[1] / "memory" / name
+
+
+def _read_tail_chars(path, max_chars):
+    try:
+        max_chars = max(0, int(float(max_chars)))
+    except Exception:
+        max_chars = 0
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return f"CONTEXT-READ-ERROR {type(exc).__name__}: {exc}"
+    if max_chars and len(text) > max_chars:
+        return text[-max_chars:]
+    return text
+
+
+def _escape_section_text(text):
+    return normalize_string(text).strip()
+
+
+def _compact_line(text, limit=320):
+    clean = " ".join(normalize_string(text).replace("\\n", "\n").split())
+    if len(clean) > limit:
+        return clean[: max(0, limit - 24)] + f" ... <chars={len(clean)}>"
+    return clean
+
+
+def _safe_unquote(text):
+    try:
+        return json.loads('"' + str(text).replace('\\', '\\\\').replace('"', '\\"') + '"')
+    except Exception:
+        return str(text or "")
+
+
+def _error_body_head(text):
+    clean = " ".join(normalize_string(text).split())
+    if not clean:
+        return "empty"
+    token = clean.split(" ", 1)[0].strip('"()[]{}:;,.')
+    return token[:80] or "text"
+
+
+def _error_hint_key(hint):
+    hint = normalize_string(hint)
+    if "Capability card:" in hint:
+        card = hint.split("Capability card:", 1)[1].strip().split(";", 1)[0].strip()
+        if card:
+            return "card=" + _compact_line(card, 90)
+    first = hint.split(".", 1)[0].strip()
+    return _compact_line(first or "generic-syntax-recovery", 100)
+
+
+def _bounded_error_context(decoded):
+    """Render an error for live context without reinserting toxic bodies.
+
+    Raw history remains exact. This is only the prompt-facing ERROR_RECENT view.
+    """
+    text = normalize_string(decoded)
+    match = _SYNTAX_ERROR_RE.search(text)
+    if match:
+        kind, head, raw, hint = (_safe_unquote(part) for part in match.groups())
+        raw_head = _error_body_head(raw)
+        parts = [
+            f"kind={_compact_line(kind, 80)}",
+            f"head={_compact_line(head, 80)}",
+            f"raw_head={raw_head}",
+            f"raw_chars={len(raw)}",
+            f"hint_key={_error_hint_key(hint)}",
+        ]
+    else:
+        raw_head = _error_body_head(text)
+        parts = [
+            "kind=error-context",
+            f"raw_head={raw_head}",
+            f"raw_chars={len(text)}",
+            "hint_key=see raw history/logs",
+        ]
+    for noisy in _LIVE_ERROR_NOISE_HEADS:
+        if raw_head == noisy or raw_head.startswith(noisy):
+            parts.append(f"body_preview={noisy} <omitted raw-history-preserved>")
+            break
+    parts.append(f"hash={_stable_hash(text)}")
+    return " ".join(parts)
+
+
+def _mechanical_excerpt(text, limit):
+    text = normalize_string(text)
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 1200
+    if limit <= 0 or len(text) <= limit:
+        return text
+    half = max(1, limit // 2)
+    omitted = len(text) - (half * 2)
+    return text[:half] + f"\n<omitted chars={omitted}>\n" + text[-half:]
+
+
+def _decode_history_string(text):
+    return (
+        normalize_string(text)
+        .replace(r"\"", '"')
+        .replace("_quote_", '"')
+        .replace("_apostrophe_", "'")
+        .replace("_newline_", "\n")
+    )
+
+
+def _history_entries(text):
+    text = normalize_string(text)
+    starts = [match.start() for match in _HISTORY_ENTRY_RE.finditer(text)]
+    if not starts:
+        return [text] if text.strip() else []
+    entries = []
+    if starts[0] > 0 and text[: starts[0]].strip():
+        entries.append(text[: starts[0]])
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(text)
+        chunk = text[start:end].strip()
+        if chunk:
+            entries.append(chunk)
+    return entries
+
+
+def _entry_time(entry):
+    match = _HISTORY_TIME_RE.search(entry)
+    return match.group(1) if match else ""
+
+
+def _command_records(entry):
+    decoded = _decode_history_string(entry)
+    records = []
+    for regex in (_QUOTED_COMMAND_RE, _UNDERSCORE_QUOTED_COMMAND_RE):
+        for command, body in regex.findall(decoded):
+            records.append((command, _decode_history_string(body)))
+    return records
+
+
+def _human_message(entry):
+    decoded = _decode_history_string(entry)
+    match = _HUMAN_MESSAGE_RE.search(decoded)
+    if match:
+        return _escape_section_text(match.group(1))
+    return ""
+
+
+def _entry_is_prompt_echo(entry):
+    return any(marker in entry for marker in _PROMPT_ECHO_MARKERS)
+
+
+def _entry_is_anti_spam(entry):
+    return _ANTI_SPAM_MARKER in entry
+
+
+def _entry_is_wake(entry):
+    decoded = _decode_history_string(entry)
+    if _WAKE_RE.search(decoded):
+        return True
+    human = _human_message(entry)
+    if human and len(human) <= 160 and "?" not in human and _WAKE_CHATTER_RE.search(human):
+        return True
+    return False
+
+
+def _stable_hash(text):
+    import hashlib
+
+    return hashlib.sha256(normalize_string(text).encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _unique_latest(records, key_index, limit):
+    seen = set()
+    out = []
+    for record in reversed(records):
+        key = record[key_index]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(record)
+        if len(out) >= limit:
+            break
+    return list(reversed(out))
+
+
+def _artifact_pointers(text):
+    return _ARTIFACT_POINTER_RE.findall(_decode_history_string(text))
+
+
+def _bounded_exact_record(label, text, limit):
+    text = _escape_section_text(text)
+    if len(text) <= limit:
+        return f"{label}:\n{text}"
+    return f"{label}: <omitted-too-large chars={len(text)} hash={_stable_hash(text)} raw-history-preserved>"
+
+
+def context_history_view(max_chars=30000):
+    """Render a prompt-facing continuity view of raw history.
+
+    Raw history is not rewritten. Selection is mechanical role/window handling
+    driven by ContextWindow/ContextOmitAlways policy atoms.
+    """
+    raw = _read_tail_chars(_core_memory_path("history.metta"), max(30000, int(float(max_chars or 0)) * 4 if str(max_chars or "").strip() else 30000))
+    if raw.startswith("CONTEXT-READ-ERROR "):
+        return raw
+    entries = _history_entries(raw)
+    human_records = []
+    pin_records = []
+    send_records = []
+    error_records = []
+    artifact_records = []
+    recall_records = []
+    omitted = {
+        "prompt-echo": 0,
+        "anti-spam-echo": 0,
+        "wake-chatter": 0,
+        "older-pin": 0,
+        "older-send": 0,
+        "older-human": 0,
+        "duplicate-error": 0,
+    }
+    seen_errors = set()
+
+    for entry in entries:
+        timestamp = _entry_time(entry)
+        decoded = _decode_history_string(entry)
+        has_error_context = bool(_ERROR_CONTEXT_RE.search(decoded))
+        if _entry_is_prompt_echo(entry) and not has_error_context:
+            omitted["prompt-echo"] += 1
+            continue
+        if _entry_is_anti_spam(entry):
+            omitted["anti-spam-echo"] += 1
+            continue
+        is_wake = _entry_is_wake(entry)
+        if is_wake:
+            omitted["wake-chatter"] += 1
+        human = _human_message(entry)
+        if human and not is_wake:
+            human_records.append((timestamp, human))
+        if has_error_context:
+            key = _stable_hash(re.sub(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", "", decoded))
+            if key in seen_errors:
+                omitted["duplicate-error"] += 1
+            else:
+                seen_errors.add(key)
+                error_records.append((timestamp, key, _bounded_error_context(decoded)))
+        for command, body in _command_records(entry):
+            if command == "pin":
+                pin_records.append((timestamp, body))
+            elif command == "send":
+                send_records.append((timestamp, body))
+            elif command in {"write-file", "append-file", "read-file"}:
+                pointers = _artifact_pointers(body)
+                if pointers:
+                    for path in pointers:
+                        artifact_records.append((timestamp, command, path, "history-command"))
+                else:
+                    artifact_records.append((timestamp, command, _compact_line(body, 180), "history-command"))
+            elif command in {"query", "episodes", "search"}:
+                recall_records.append((timestamp, command, _compact_line(body, 260)))
+        for path in _artifact_pointers(decoded):
+            artifact_records.append((timestamp, "observed", path, "history"))
+
+    human_total = _context_window("human-message", "full", 1) + _context_window("human-message", "compact", 6) + _context_window("human-message", "breadcrumb", 12)
+    pin_total = _context_window("pin", "full", 1) + _context_window("pin", "compact", 7)
+    send_total = _context_window("send", "exact", 6)
+    recall_total = _context_window("recall-result", "compact", 10)
+    artifact_total = _context_window("artifact-pointer", "compact", 16)
+    error_total = _context_window("error", "compact", 5)
+
+    shown_humans = human_records[-human_total:] if human_total else []
+    shown_pins = pin_records[-pin_total:] if pin_total else []
+    shown_sends = send_records[-send_total:] if send_total else []
+    shown_recalls = recall_records[-recall_total:] if recall_total else []
+    shown_artifacts = _unique_latest(artifact_records, 2, artifact_total) if artifact_total else []
+    shown_errors = error_records[-error_total:] if error_total else []
+    omitted["older-human"] += max(0, len(human_records) - len(shown_humans))
+    omitted["older-pin"] += max(0, len(pin_records) - len(shown_pins))
+    omitted["older-send"] += max(0, len(send_records) - len(shown_sends))
+    omitted["older-recall"] = max(0, len(recall_records) - len(shown_recalls))
+    omitted["older-artifact-pointer"] = max(0, len(artifact_records) - len(shown_artifacts))
+    omitted["older-error"] = max(0, len(error_records) - len(shown_errors))
+
+    sections = ["CONTEXT_VIEW:"]
+    if shown_humans:
+        sections.append("HUMAN_RECENT:")
+        newest_index = len(shown_humans) - 1
+        for idx, (timestamp, text) in enumerate(reversed(shown_humans)):
+            label = "latest" if idx == 0 else f"previous[{idx}]"
+            limit = 1400 if idx == 0 else 420
+            content = text if idx == 0 else _compact_line(text, limit)
+            sections.append(f"{label} time={timestamp}: {content}")
+
+    if shown_pins:
+        sections.append("PIN_RECENT:")
+        for idx, (timestamp, text) in enumerate(reversed(shown_pins)):
+            label = "latest" if idx == 0 else f"previous[{idx}]"
+            content = text if idx == 0 else _compact_line(text, 420)
+            sections.append(f"{label} time={timestamp}: {content}")
+
+    if shown_sends:
+        sections.append("SEND_RECENT:")
+        send_limit = _context_large("send", 6000)
+        for idx, (timestamp, text) in enumerate(reversed(shown_sends)):
+            label = "latest" if idx == 0 else f"previous[{idx}]"
+            sections.append(_bounded_exact_record(f"{label} time={timestamp}", text, send_limit))
+
+    if shown_recalls:
+        sections.append("RECALL_RECENT:")
+        for timestamp, command, body in shown_recalls[::-1]:
+            sections.append(f"{command} time={timestamp}: {body}")
+
+    if shown_artifacts:
+        sections.append("ARTIFACT_POINTERS:")
+        for timestamp, command, pointer, source in shown_artifacts[::-1]:
+            when = f" time={timestamp}" if timestamp else ""
+            sections.append(f"{command}{when}: path={pointer} source={source}")
+
+    if shown_errors:
+        sections.append("ERROR_RECENT:")
+        for timestamp, key, text in shown_errors[::-1]:
+            sections.append(f"time={timestamp} key={key}: {text}")
+
+    omissions = [f"{key} x{count}" for key, count in omitted.items() if count]
+    if omissions:
+        sections.append("OMITTED_CONTEXT:")
+        sections.extend(omissions)
+    rendered = "\n".join(sections)
+    try:
+        max_chars = max(0, int(float(max_chars)))
+    except Exception:
+        max_chars = 30000
+    if max_chars and len(rendered) > max_chars:
+        rendered = _mechanical_excerpt(rendered, max_chars)
+    return rendered
+
+
+def context_lastresults_view(results, max_chars=12000):
+    """Render current last-results without unbounded raw payload growth."""
+    text = normalize_string(results)
+    if not text.strip():
+        return ""
+    skill_result_token = "SKILL" + "_RESULT"
+    skill_results = re.findall(r"\(" + skill_result_token + r"\s+([^\s()]+)\s+([^\s()]+)\)", text)
+    lines = ["LAST_RESULTS_VIEW:"]
+    if skill_results:
+        lines.append("SKILL" + "_RESULTS:")
+        counts = {}
+        for item in skill_results:
+            counts[item] = counts.get(item, 0) + 1
+        for (command, status), count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+            suffix = f" x{count}" if count > 1 else ""
+            lines.append(f"({skill_result_token} {command} {status}){suffix}")
+    artifact_pointers = _unique_latest([(path, "last-results") for path in _artifact_pointers(text)], 0, _context_window("artifact-pointer", "compact", 16))
+    if artifact_pointers:
+        lines.append("ARTIFACT_POINTERS:")
+        for path, source in artifact_pointers[::-1]:
+            lines.append(f"observed: path={path} source={source}")
+    raw_limit = _context_large("raw-result", 6000)
+    lines.append("RAW_RESULTS:")
+    if len(text) <= raw_limit:
+        lines.append(text)
+    else:
+        lines.append(_mechanical_excerpt(text, raw_limit))
+        lines.append(f"OMITTED_CONTEXT: raw-result chars={len(text)} hash={_stable_hash(text)} mechanically-excerpted")
+    rendered = "\n".join(lines)
+    try:
+        max_chars = max(0, int(float(max_chars)))
+    except Exception:
+        max_chars = 12000
+    if max_chars and len(rendered) > max_chars:
+        rendered = _mechanical_excerpt(rendered, max_chars)
+    return rendered
 
 
 def quote_arg(value):
