@@ -52,7 +52,7 @@
 (= (send $msg)
    (if (!= $msg (get-state &lastsend))
        (progn (change-state! &lastsend $msg)
-              (let $safemsg (string-replace $msg  "\n" "\\n")
+              (let $safemsg (py-call (helper.normalize_send_text $msg))
                    (if (== (commchannel) irc)
                        (let $temp (cut) (py-call (irc.send_message $safemsg)))
                        (if (== (commchannel) telegram)

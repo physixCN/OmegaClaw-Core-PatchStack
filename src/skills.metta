@@ -54,11 +54,24 @@
 (= (technical-analysis $ticker)
    (py-call (agentverse.technical_analysis $ticker)))
 
+(= (syntax-error $kind $head $raw $hint)
+   (SYNTAX-ERROR $kind $head $raw $hint))
+
 !(import_prolog_functions_from_file (library OmegaClaw-Core ./src/skills.pl) (shell first_char gc read_file_tail))
 
 (= (metta $str)
-   (let $code (sread $str)
-        (repr (swrite (eval $code)))))
+   (let $code (catch (sread $str))
+        (case $code
+              (((Error $a $b)
+                (syntax-error "invalid-metta-expression" "metta" $str
+                              "MeTTa reader could not parse this expression. Use one valid MeTTa expression after metta."))
+               ($else
+                (let $result (catch (eval $code))
+                     (case $result
+                           (((Error $ea $eb)
+                            (syntax-error "metta-eval-error" "metta" $str
+                                           "MeTTa expression parsed, but evaluation failed. Check MeTTa semantics or run a smaller expression."))
+                            ($ok (repr (swrite $ok)))))))))))
 
 (= (pin $x)
    PIN-SUCCESS)
