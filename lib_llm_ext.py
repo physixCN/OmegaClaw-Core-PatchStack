@@ -7,6 +7,16 @@ def _log_raw(provider: str, model: str, raw: str) -> None:
     print(f"[LLM_RAW] ts={ts} provider={provider} model={model} chars={len(raw or '')} raw={raw!r}")
 
 
+def _split_chat_content(content: str) -> list[dict[str, str]]:
+    if ":-:-:-:" not in content:
+        return [{"role": "user", "content": content}]
+    sysmsg, usermsg = content.split(":-:-:-:", 1)
+    return [
+        {"role": "system", "content": sysmsg},
+        {"role": "user", "content": usermsg},
+    ]
+
+
 class AbstractAIProvider:
     def __init__(self, name: str):
         self._name = name
@@ -72,17 +82,18 @@ class AIProvider(AbstractAIProvider):
         if self._client is None:
             raise RuntimeError(f"{self.name} not configured (set {self._var_name})")
 
-        content = content.replace(":-:-:-:", " ")
+        messages = _split_chat_content(content)
         try:
+            model_name = kwargs.pop("model", self._model_name)
             response = self._client.chat.completions.create(
-                model=self._model_name,
-                messages=[{"role": "user", "content": content}],
+                model=model_name,
+                messages=messages,
                 max_tokens=max_tokens,
                 **kwargs
             )
 
             raw = response.choices[0].message.content or ""
-            _log_raw(self._name, self._model_name, raw)
+            _log_raw(self._name, model_name, raw)
             return self._clean_text(raw)
         except Exception as e:
             print(f"[lib_llm_ext.AIProvider.chat] Exception while communicating with LLM: {e}")
@@ -93,7 +104,7 @@ class AIProvider(AbstractAIProvider):
         return text.replace("_quote_", '"').replace("_apostrophe_", "'")
 
 class OpenRouterProvider(AIProvider):
-    """OpenRouter provider with reasoning mode enabled (reasoning tokens excluded from the response)."""
+    """OpenRouter provider with env-driven model, provider route, and reasoning mode."""
 
     def _create_client(self) -> Optional[openai.OpenAI]:
         """Create OpenRouter client from environment."""
@@ -110,14 +121,43 @@ class OpenRouterProvider(AIProvider):
 
         return None
 
+    def _selected_model(self) -> str:
+        return os.environ.get("OMEGACLAW_OPENROUTER_MODEL", "").strip() or self._model_name
+
+    def _reasoning_body(self, reasoning: str) -> dict | None:
+        mode = (reasoning or os.environ.get("OMEGACLAW_REASONING_MODE", "") or "").strip().lower()
+        if not mode:
+            mode = "medium"
+        if mode in {"off", "false", "0"}:
+            return None
+        if mode in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            return {"effort": mode, "exclude": True}
+        return {"enabled": True, "exclude": True}
+
+    def _provider_body(self) -> dict | None:
+        provider_order = os.environ.get("OMEGACLAW_OPENROUTER_PROVIDER_ORDER", "").strip()
+        provider_sort = os.environ.get("OMEGACLAW_OPENROUTER_PROVIDER_SORT", "").strip()
+        provider_body: dict = {}
+        if provider_order:
+            provider_body["order"] = [item.strip() for item in provider_order.split(",") if item.strip()]
+            allow_fallbacks = os.environ.get("OMEGACLAW_OPENROUTER_ALLOW_FALLBACKS", "").strip().lower()
+            if allow_fallbacks in {"0", "false", "no", "off"}:
+                provider_body["allow_fallbacks"] = False
+            elif allow_fallbacks in {"1", "true", "yes", "on"}:
+                provider_body["allow_fallbacks"] = True
+        elif provider_sort:
+            provider_body["sort"] = provider_sort
+        return provider_body or None
+
     def chat(self, content: str, max_tokens: int = 6000, reasoning: str = "medium", **kwargs) -> str:
-        return super().chat(content, max_tokens, reasoning, extra_body={
-            "reasoning": {
-                "enabled": True,
-                "max_tokens": 6000,
-                "exclude": True,
-            }
-        }, **kwargs)
+        extra_body = kwargs.pop("extra_body", {}).copy()
+        reasoning_body = self._reasoning_body(reasoning)
+        provider_body = self._provider_body()
+        if reasoning_body:
+            extra_body["reasoning"] = reasoning_body
+        if provider_body:
+            extra_body["provider"] = provider_body
+        return super().chat(content, max_tokens, reasoning, model=self._selected_model(), extra_body=extra_body, **kwargs)
 
 class AsiOneProvider(AIProvider):
     """Lazy AI provider with on-demand initialization."""
@@ -265,5 +305,4 @@ def useLocalEmbedding(atom):
         atom,
         normalize_embeddings=True
     ).tolist()
-
 
