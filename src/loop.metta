@@ -6,12 +6,10 @@
 (= (maxOutputToken) (empty))
 (= (reasoningMode) (empty))
 (= (wakeupInterval) (empty))
-(= (spamShield) (empty))
 
 (= (initLoop)
    (progn (configure maxNewInputLoops 50) ;20
           (configure maxWakeLoops 1)
-          (configure spamShield True)
           (configure sleepInterval 1) ;10
           (configure LLM gpt-5.4)
           (configure provider Anthropic) ;Anthropic or OpenAI or ASICloud or ASIOne or Test
@@ -61,7 +59,7 @@
                              ($_ (if (and (> $k 1) $msgnew)
                                      (change-state! &loops (maxNewInputLoops)) _)))
                             (if (> (get-state &loops) 0)
-                                (let* (($lastmessage (if $msgnew (HUMAN-MSG: $msg) (if (spamShield) " DO NOT RE-SEND OR SPAM!" "")))
+                                (let* (($lastmessage (if $msgnew (HUMAN-MSG: $msg) "NO_NEW_HUMAN_MESSAGE"))
                                        ($_ (change-state! &nextWakeAt (+ (get_time) (wakeupInterval))))
                                        ($_ (println! $lastmessage))
                                        ($send (py-str ($prompt :-:-:-: $lastmessage)))
